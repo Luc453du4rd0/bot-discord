@@ -306,6 +306,36 @@ async def refresh_confirmation_message(guild: discord.Guild, match_id: int):
         pass
 
 
+async def update_confirmation_message_status(guild: discord.Guild, match_id: int, status: str):
+    row = match_row(match_id)
+    if not row or not row["confirmation_message_id"] or not row["private_channel_id"]:
+        return
+
+    channel = guild.get_channel(row["private_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        msg = await channel.fetch_message(row["confirmation_message_id"])
+        players = json.loads(row["players_json"])
+
+        embed = discord.Embed(
+            title=f"Partida #{fmt_match_id(match_id)}",
+            color=0x2ECC71,
+            description=(
+                f"🎮 **Modo:** {row['mode']}\n"
+                f"💸 **Valor:** {row['info']}\n"
+                f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
+                f"📌 **Status:** {status}"
+            )
+        )
+
+        await msg.edit(embed=embed, view=None)
+
+    except discord.NotFound:
+        pass
+
+
 async def update_pending_message_as_claimed(guild: discord.Guild, match_id: int, adm: discord.Member):
     row = match_row(match_id)
     if not row or not row["pending_message_id"]:
@@ -617,11 +647,20 @@ class MatchControlView(discord.ui.View):
             await interaction.response.send_message("Canal inválido.", ephemeral=True)
             return
 
+        players = json.loads(row["players_json"])
         final_cat = find_category(interaction.guild, NOME_CATEGORIA_FINALIZADAS)
+
         if final_cat:
             await channel.edit(name=f"finalizada-{fmt_match_id(self.match_id)}", category=final_cat)
         else:
             await channel.edit(name=f"finalizada-{fmt_match_id(self.match_id)}")
+
+        for uid in players:
+            member = interaction.guild.get_member(int(uid))
+            if member:
+                await channel.set_permissions(member, overwrite=None)
+
+        await channel.set_permissions(interaction.guild.default_role, view_channel=False)
 
         with closing(db_connect()) as conn:
             cur = conn.cursor()
@@ -748,6 +787,8 @@ async def send_match_to_pending(guild: discord.Guild, match_id: int):
     private_channel = guild.get_channel(row["private_channel_id"])
     if isinstance(private_channel, discord.TextChannel):
         await private_channel.send("✅ Os dois jogadores confirmaram. Aguardando ADM assumir a partida.")
+
+    await update_confirmation_message_status(guild, match_id, "🟡 Aguardando ADM")
 
     bot.add_view(ClaimMatchView(match_id), message_id=msg.id)
     await send_staff_log(guild, f"📥 Partida #{fmt_match_id(match_id)} enviada para pendentes.")
