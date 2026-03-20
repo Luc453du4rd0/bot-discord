@@ -637,7 +637,7 @@ async def painelz(ctx, titulo: str, modo: str, info: str):
     embed = discord.Embed(title=titulo, color=0x2ECC71)
     embed.description = (
         f"🎮 **Modo:**\n{modo}\n\n"
-        f"🏷️ **{ROTULO_INFO}:**\n{info}\n\n"
+        f"🏷️ **{ROTULO_INFO}**\n{info}\n\n"
         f"👤 **Jogadores:**\nNenhum jogador na fila"
     )
     embed.set_thumbnail(url=IMAGEM_PADRAO)
