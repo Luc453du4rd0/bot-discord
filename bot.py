@@ -179,6 +179,34 @@ def active_match_for_panel(panel_id: str) -> bool:
         )
         return cur.fetchone() is not None
 
+async def update_pending_message_status(guild: discord.Guild, match_id: int, status: str):
+    row = match_row(match_id)
+    if not row or not row["pending_message_id"]:
+        return
+
+    channel = guild.get_channel(CANAL_PARTIDAS_PENDENTES_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        msg = await channel.fetch_message(row["pending_message_id"])
+
+        players = json.loads(row["players_json"])
+
+        embed = discord.Embed(
+            title=f"Partida #{fmt_match_id(match_id)}",
+            color=0x95A5A6,
+            description=(
+                f"🎮 **Modo:** {row['mode']}\n"
+                f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
+                f"📌 **Status:** {status}"
+            )
+        )
+
+        await msg.edit(embed=embed, view=None)
+
+    except discord.NotFound:
+        pass
 
 async def send_staff_log(guild: discord.Guild, text: str):
     channel = guild.get_channel(CANAL_LOGS_STAFF_ID)
@@ -215,7 +243,7 @@ def build_pending_match_embed(match_id: int) -> discord.Embed:
             f"🎮 **Modo:** {row['mode']}\n"
             f"💸 **Valor:**\n"
             f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
-            f"📌 **Status:** Pendente"
+            f"📌 **Status:** 🟡 Pendente"
         )
     )
     return embed
@@ -232,7 +260,7 @@ def build_claimed_match_embed(match_id: int, adm_mention: str) -> discord.Embed:
             f"🎮 **Modo:** {row['mode']}\n"
             f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
             f"✅ **Assumida por:** {adm_mention}\n"
-            f"📌 **Status:** Em andamento"
+            f"📌 **Status:** 🟢 Em andamento"
         )
     )
     return embed
@@ -463,6 +491,7 @@ class MatchControlView(discord.ui.View):
             conn.commit()
 
         await send_staff_log(interaction.guild, f"✅ Partida #{fmt_match_id(self.match_id)} finalizada por {interaction.user.mention}")
+        await update_pending_message_status(interaction.guild, self.match_id, "🔴 Finalizada")
         await interaction.response.defer()
 
 
