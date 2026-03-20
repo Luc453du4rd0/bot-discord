@@ -1,0 +1,53 @@
+using KeyAuth;
+
+------------------------------------------------------------
+
+KeyAuthApp.init();
+
+------------------------------------------------------------
+
+https://keyauth.cc/app/
+
+------------------------------------------------------------
+
+Cod button LOGIN SENHA
+{
+    KeyAuthApp.login(Username.Text, Pass.Text);
+    if (KeyAuthApp.response.success)
+    {
+        (LABEL).Text = KeyAuthApp.response.message;
+        Form2 main = new Form2();
+        main.Show();
+        this.Hide();
+    }
+    else
+    {
+        (LABEL).Text = KeyAuthApp.response.message;
+    }
+}
+
+------------------------------------------------------------
+
+Cod button KEY LICENSE
+
+KeyAuthApp.license(usernametxtbox.Text); // Isso também pode não ser async
+if (KeyAuthApp.response.success)
+{
+    Form2 main = new Form2();
+    main.Show();
+    this.Hide();
+}
+else
+{
+    MessageBox.Show("Licença inválida: " + KeyAuthApp.response.message);
+}
+
+------------------------------------------------------------
+
+public static api KeyAuthApp = new api(
+    name: "jny7atua1jdahh", // App name
+    ownerid: "Loo2tJUaWs", // Account ID
+    secret: "fc1c3e6264a2e88580af18534115d9993d1ce59d261cf75f00a64018e645e8d80",
+    version: "1.0" // Application version. Used for automatic downloads see video here https://www.youtube.com/watch?v=kW195PLCBKs
+    //path: @"Your_Path_Here" // (OPTIONAL) see tutorial here https://www.youtube.com/watch?v=I9rxt82IgMk&t=1s
+);

@@ -1,0 +1,1 @@
+[{"type":" ","name":"FirebaseCloudMessaging instance","palette":"24","spec":"%m.FirebaseCloudMessage instanceId","code":"FirebaseInstanceId.getInstance().getInstanceId().addOnCompleteListener(%s_onCompleteListener);"}]

@@ -1,0 +1,1 @@
+[{"code":"Intent intent \u003d new Intent(\"android.intent.action.MAIN\");\nintent.setClassName(%s,%s);\nthis.startActivity(intent);","name":"Open other class","palette":"49","type":" ","spec":"package name %s class package %s"}]

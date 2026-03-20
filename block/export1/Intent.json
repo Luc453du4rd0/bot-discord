@@ -1,0 +1,1 @@
+[{"code":"%1$s.setType(%2$s);","name":"Intent setType","palette":"102","type":" ","spec":"%m.intent setType%s"},{"code":"%1$s.hasExtra(%2$s)","name":"Intent hasExtra","palette":"102","type":"b","spec":"%m.intent hasExtra%s"},{"code":"Intent.%s","name":"Intent extraString","palette":"102","type":"s","spec":"getIntentExtra %m.IntentExtra"}]

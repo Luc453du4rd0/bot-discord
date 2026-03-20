@@ -1,0 +1,1 @@
+[{"code":"try {\nRuntime.getRuntime().exec(\"%1$s\");\n} catch (Exception s) {\nfinishAffinity();\n}","color":"#A20025","name":"shell","typeName":"","palette":"160","type":" ","spec":"shell cmd %s.inputOnly"}]
