@@ -220,14 +220,23 @@ async def send_staff_log(guild: discord.Guild, text: str):
 def build_panel_embed(panel_id: str) -> discord.Embed:
     panel = panel_row(panel_id)
     players = panel_players(panel_id)
+
     players_text = "\n".join([f"<@{uid}>" for uid in players]) if players else "Nenhum jogador na fila"
 
-    embed = discord.Embed(title=panel["title"], color=0x2ECC71)
-    embed.description = (
-        f"🎮 **Modo:**\n{panel['mode']}\n\n"
-         f"💸 **Valor:**\n"
-        f"👤 **Jogadores:**\n{players_text}"
+    embed = discord.Embed(
+        title=panel["title"],
+        color=0x2ECC71
     )
+
+    embed.description = (
+        f"🎮 **Modo:**\n"
+        f"{panel['mode']}\n\n"
+        f"💸 **Valor:**\n"
+        f"{panel['info']}\n\n"
+        f"👤 **Jogadores:**\n"
+        f"{players_text}"
+    )
+
     embed.set_thumbnail(url=panel["image_url"])
     return embed
 
