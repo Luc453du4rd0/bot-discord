@@ -1,9 +1,13 @@
 import os
+import io
+import re
 import json
 import sqlite3
+from decimal import Decimal, InvalidOperation
 from contextlib import closing
 
 import discord
+import qrcode
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -20,6 +24,9 @@ CANAL_LOGS_STAFF_ID = 1484549436704166020
 NOME_CARGO_ADM = "ADM"
 NOME_CATEGORIA_EM_ANDAMENTO = "EM ANDAMENTO"
 NOME_CATEGORIA_FINALIZADAS = "FINALIZADAS"
+
+# Cidade fixa do BR Code Pix (não vai no formulário)
+PIX_CIDADE_PADRAO = "TAVARES"
 
 DB_FILE = "bot_data.sqlite3"
 
@@ -38,6 +45,16 @@ def db_connect():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_column_exists(table_name: str, column_name: str, column_definition: str):
+    with closing(db_connect()) as conn:
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [row["name"] for row in cur.fetchall()]
+        if column_name not in cols:
+            cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+            conn.commit()
 
 
 def db_init():
@@ -97,6 +114,13 @@ def db_init():
             cur.execute("INSERT INTO meta (key, value) VALUES ('counter', '0')")
 
         conn.commit()
+
+    # Migrações simples para compatibilidade
+    ensure_column_exists("matches", "claimed_by", "INTEGER")
+    ensure_column_exists("matches", "control_message_id", "INTEGER")
+    ensure_column_exists("matches", "pending_message_id", "INTEGER")
+    ensure_column_exists("matches", "confirmation_message_id", "INTEGER")
+    ensure_column_exists("matches", "private_channel_id", "INTEGER")
 
 
 def get_counter() -> int:
@@ -182,6 +206,101 @@ def active_match_for_panel(panel_id: str) -> bool:
         return cur.fetchone() is not None
 
 
+def parse_decimal_brl(value_str: str) -> Decimal:
+    value_str = value_str.strip().replace("R$", "").replace(" ", "")
+    value_str = value_str.replace(".", "").replace(",", ".")
+    value = Decimal(value_str)
+    if value <= 0:
+        raise InvalidOperation
+    return value.quantize(Decimal("0.01"))
+
+
+def format_brl(value: Decimal) -> str:
+    return f"R$ {str(value.quantize(Decimal('0.01'))).replace('.', ',')}"
+
+
+def normalize_pix_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]+", "", name).strip().upper()
+    return cleaned[:25] if cleaned else "RECEBEDOR"
+
+
+def normalize_pix_city(city: str) -> str:
+    cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]+", "", city).strip().upper()
+    return cleaned[:15] if cleaned else "BRASIL"
+
+
+def emv(field_id: str, value: str) -> str:
+    return f"{field_id}{len(value):02d}{value}"
+
+
+def crc16_ccitt(payload: str) -> str:
+    polynomial = 0x1021
+    crc = 0xFFFF
+
+    for ch in payload:
+        crc ^= (ord(ch) << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ polynomial) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+
+    return f"{crc:04X}"
+
+
+def build_pix_payload(pix_key: str, receiver_name: str, amount: Decimal, city: str = PIX_CIDADE_PADRAO) -> str:
+    pix_key = pix_key.strip()
+    receiver_name = normalize_pix_name(receiver_name)
+    city = normalize_pix_city(city)
+    amount_str = f"{amount:.2f}"
+
+    merchant_account_info = (
+        emv("00", "BR.GOV.BCB.PIX") +
+        emv("01", pix_key)
+    )
+
+    additional_data = emv("05", "***")
+
+    payload = (
+        emv("00", "01") +                     # Payload Format Indicator
+        emv("26", merchant_account_info) +   # Merchant Account Information
+        emv("52", "0000") +                  # Merchant Category Code
+        emv("53", "986") +                   # Currency BRL
+        emv("54", amount_str) +              # Amount
+        emv("58", "BR") +                    # Country Code
+        emv("59", receiver_name) +           # Merchant Name
+        emv("60", city) +                    # Merchant City
+        emv("62", additional_data) +         # Additional Data Field
+        "6304"
+    )
+
+    crc = crc16_ccitt(payload)
+    return payload + crc
+
+
+def generate_qr_file(payload: str, filename: str = "pix_qrcode.png") -> discord.File:
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(payload)
+    qr.make(fit=True)
+
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename=filename)
+
+
+def can_manage_match(member: discord.Member, row) -> bool:
+    if not is_adm_member(member):
+        return False
+
+    claimed_by = row["claimed_by"]
+    if claimed_by is None:
+        return True
+
+    return int(claimed_by) == member.id
+
+
 async def send_staff_log(guild: discord.Guild, text: str):
     channel = guild.get_channel(CANAL_LOGS_STAFF_ID)
     if isinstance(channel, discord.TextChannel):
@@ -232,36 +351,21 @@ def build_confirmation_embed(match_id: int) -> discord.Embed:
     return embed
 
 
-def build_pending_match_embed(match_id: int) -> discord.Embed:
+def build_match_status_embed(match_id: int, status_text: str, color: int, adm_mention: str | None = None) -> discord.Embed:
     row = match_row(match_id)
     players = json.loads(row["players_json"])
 
-    embed = discord.Embed(
-        title=f"Partida #{fmt_match_id(match_id)}",
-        color=0x3498DB,
-        description=(
-            f"🎮 **Modo:** {row['mode']}\n"
-            f"💸 **Valor:** {row['info']}\n"
-            f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
-            f"📌 **Status:** 🟡 Pendente"
-        )
-    )
-    return embed
-
-
-def build_claimed_match_embed(match_id: int, adm_mention: str) -> discord.Embed:
-    row = match_row(match_id)
-    players = json.loads(row["players_json"])
+    extra = f"\n✅ **Assumida por:** {adm_mention}" if adm_mention else ""
 
     embed = discord.Embed(
         title=f"Partida #{fmt_match_id(match_id)}",
-        color=0x2ECC71,
+        color=color,
         description=(
             f"🎮 **Modo:** {row['mode']}\n"
             f"💸 **Valor:** {row['info']}\n"
-            f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
-            f"✅ **Assumida por:** {adm_mention}\n"
-            f"📌 **Status:** 🟢 Em andamento"
+            f"👤 **Jogadores:** {mention_list_from_ids(players)}"
+            f"{extra}\n"
+            f"📌 **Status:** {status_text}"
         )
     )
     return embed
@@ -306,7 +410,7 @@ async def refresh_confirmation_message(guild: discord.Guild, match_id: int):
         pass
 
 
-async def update_confirmation_message_status(guild: discord.Guild, match_id: int, status: str):
+async def update_confirmation_message_status(guild: discord.Guild, match_id: int, status: str, color: int = 0x2ECC71):
     row = match_row(match_id)
     if not row or not row["confirmation_message_id"] or not row["private_channel_id"]:
         return
@@ -319,40 +423,25 @@ async def update_confirmation_message_status(guild: discord.Guild, match_id: int
         msg = await channel.fetch_message(row["confirmation_message_id"])
         players = json.loads(row["players_json"])
 
+        adm_mention = f"<@{row['claimed_by']}>" if row["claimed_by"] else None
         embed = discord.Embed(
             title=f"Partida #{fmt_match_id(match_id)}",
-            color=0x2ECC71,
+            color=color,
             description=(
                 f"🎮 **Modo:** {row['mode']}\n"
                 f"💸 **Valor:** {row['info']}\n"
                 f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
-                f"📌 **Status:** {status}"
+                + (f"✅ **Assumida por:** {adm_mention}\n" if adm_mention else "")
+                + f"📌 **Status:** {status}"
             )
         )
 
         await msg.edit(embed=embed, view=None)
-
     except discord.NotFound:
         pass
 
 
-async def update_pending_message_as_claimed(guild: discord.Guild, match_id: int, adm: discord.Member):
-    row = match_row(match_id)
-    if not row or not row["pending_message_id"]:
-        return
-
-    pending_channel = guild.get_channel(CANAL_PARTIDAS_PENDENTES_ID)
-    if not isinstance(pending_channel, discord.TextChannel):
-        return
-
-    try:
-        msg = await pending_channel.fetch_message(row["pending_message_id"])
-        await msg.edit(embed=build_claimed_match_embed(match_id, adm.mention), view=None)
-    except discord.NotFound:
-        pass
-
-
-async def update_pending_message_status(guild: discord.Guild, match_id: int, status: str):
+async def update_pending_message_embed(guild: discord.Guild, match_id: int, status: str, color: int, remove_view: bool = True):
     row = match_row(match_id)
     if not row or not row["pending_message_id"]:
         return
@@ -363,23 +452,48 @@ async def update_pending_message_status(guild: discord.Guild, match_id: int, sta
 
     try:
         msg = await channel.fetch_message(row["pending_message_id"])
-        players = json.loads(row["players_json"])
-
-        embed = discord.Embed(
-            title=f"Partida #{fmt_match_id(match_id)}",
-            color=0x95A5A6,
-            description=(
-                f"🎮 **Modo:** {row['mode']}\n"
-                f"💸 **Valor:** {row['info']}\n"
-                f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
-                f"📌 **Status:** {status}"
-            )
-        )
-
-        await msg.edit(embed=embed, view=None)
-
+        adm_mention = f"<@{row['claimed_by']}>" if row["claimed_by"] else None
+        embed = build_match_status_embed(match_id, status, color, adm_mention=adm_mention)
+        await msg.edit(embed=embed, view=None if remove_view else ClaimMatchView(match_id))
     except discord.NotFound:
         pass
+
+
+async def update_control_message(guild: discord.Guild, match_id: int):
+    row = match_row(match_id)
+    if not row or not row["control_message_id"] or not row["private_channel_id"]:
+        return
+
+    channel = guild.get_channel(row["private_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        msg = await channel.fetch_message(row["control_message_id"])
+    except discord.NotFound:
+        return
+
+    status_map = {
+        "claimed": "🟡 Em preparação",
+        "in_progress": "🔴 Em andamento",
+        "finished": "✅ Finalizada"
+    }
+    status_text = status_map.get(row["status"], row["status"])
+    players = json.loads(row["players_json"])
+    adm_mention = f"<@{row['claimed_by']}>" if row["claimed_by"] else "Não definido"
+
+    content = (
+        f"🎮 **Painel da Partida #{fmt_match_id(match_id)}**\n"
+        f"ADM responsável: {adm_mention}\n"
+        f"Jogadores: {mention_list_from_ids(players)}\n"
+        f"Status atual: {status_text}\n\n"
+        f"O ADM responsável pode abrir o painel privado no botão abaixo."
+    )
+
+    if row["status"] == "finished":
+        await msg.edit(content=content, view=None)
+    else:
+        await msg.edit(content=content, view=AdminAccessView(match_id))
 
 
 # =========================
@@ -581,31 +695,83 @@ class ClaimMatchView(discord.ui.View):
             await interaction.response.send_message("Apenas ADMs podem assumir partidas.", ephemeral=True)
             return
 
-        await interaction.response.defer()
         await assume_match(interaction.guild, interaction.user, self.match_id)
 
+        await interaction.response.send_message(
+            f"Você assumiu a partida #{fmt_match_id(self.match_id)}. O painel privado foi liberado para você no canal da partida.",
+            ephemeral=True
+        )
 
-class MatchControlView(discord.ui.View):
+
+class AdminAccessView(discord.ui.View):
     def __init__(self, match_id: int):
         super().__init__(timeout=None)
         self.match_id = match_id
 
-        start_btn = discord.ui.Button(
-            label="Iniciar",
-            style=discord.ButtonStyle.success,
-            custom_id=f"start_match_{match_id}"
+        open_btn = discord.ui.Button(
+            label="Abrir painel ADM",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"open_admin_panel_{match_id}"
         )
-        finish_btn = discord.ui.Button(
-            label="Finalizar",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"finish_match_{match_id}"
+        open_btn.callback = self.open_callback
+        self.add_item(open_btn)
+
+    async def open_callback(self, interaction: discord.Interaction):
+        row = match_row(self.match_id)
+        if not row:
+            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Usuário inválido.", ephemeral=True)
+            return
+
+        if not can_manage_match(interaction.user, row):
+            await interaction.response.send_message("Apenas o ADM responsável pode usar esse painel.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"Painel privado da partida #{fmt_match_id(self.match_id)}:",
+            ephemeral=True,
+            view=AdminEphemeralControlView(self.match_id)
         )
 
-        start_btn.callback = self.start_callback
-        finish_btn.callback = self.finish_callback
 
-        self.add_item(start_btn)
-        self.add_item(finish_btn)
+class AdminEphemeralControlView(discord.ui.View):
+    def __init__(self, match_id: int):
+        super().__init__(timeout=300)
+        self.match_id = match_id
+
+        row = match_row(match_id)
+        if not row:
+            return
+
+        if row["status"] == "claimed":
+            start_btn = discord.ui.Button(
+                label="Iniciar",
+                style=discord.ButtonStyle.success,
+                custom_id=f"start_match_{match_id}"
+            )
+            start_btn.callback = self.start_callback
+            self.add_item(start_btn)
+
+        if row["status"] in ("claimed", "in_progress"):
+            pix_btn = discord.ui.Button(
+                label="Gerar cobrança",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"generate_pix_{match_id}"
+            )
+            pix_btn.callback = self.generate_pix_callback
+            self.add_item(pix_btn)
+
+        if row["status"] == "in_progress":
+            finish_btn = discord.ui.Button(
+                label="Finalizar",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"finish_match_{match_id}"
+            )
+            finish_btn.callback = self.finish_callback
+            self.add_item(finish_btn)
 
     async def start_callback(self, interaction: discord.Interaction):
         row = match_row(self.match_id)
@@ -613,13 +779,17 @@ class MatchControlView(discord.ui.View):
             await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
             return
 
-        if not isinstance(interaction.user, discord.Member) or not is_adm_member(interaction.user):
-            await interaction.response.send_message("Apenas ADMs podem usar esse botão.", ephemeral=True)
+        if row["status"] != "claimed":
+            await interaction.response.send_message("Essa partida não está em preparação.", ephemeral=True)
             return
 
-        channel = interaction.channel
+        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
+            await interaction.response.send_message("Apenas o ADM responsável pode iniciar.", ephemeral=True)
+            return
+
+        channel = interaction.guild.get_channel(row["private_channel_id"])
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Canal inválido.", ephemeral=True)
+            await interaction.response.send_message("Canal da partida não encontrado.", ephemeral=True)
             return
 
         await channel.edit(name=f"em-andamento-{fmt_match_id(self.match_id)}")
@@ -629,8 +799,12 @@ class MatchControlView(discord.ui.View):
             cur.execute("UPDATE matches SET status = 'in_progress' WHERE match_id = ?", (self.match_id,))
             conn.commit()
 
+        await update_pending_message_embed(interaction.guild, self.match_id, "🔴 Em andamento", 0xE74C3C)
+        await update_confirmation_message_status(interaction.guild, self.match_id, "🔴 Em andamento", 0xE74C3C)
+        await update_control_message(interaction.guild, self.match_id)
+
         await send_staff_log(interaction.guild, f"▶️ Partida #{fmt_match_id(self.match_id)} iniciada por {interaction.user.mention}")
-        await interaction.response.defer()
+        await interaction.response.send_message("Partida iniciada com sucesso.", ephemeral=True)
 
     async def finish_callback(self, interaction: discord.Interaction):
         row = match_row(self.match_id)
@@ -638,11 +812,15 @@ class MatchControlView(discord.ui.View):
             await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
             return
 
-        if not isinstance(interaction.user, discord.Member) or not is_adm_member(interaction.user):
-            await interaction.response.send_message("Apenas ADMs podem usar esse botão.", ephemeral=True)
+        if row["status"] != "in_progress":
+            await interaction.response.send_message("Essa partida não está em andamento.", ephemeral=True)
             return
 
-        channel = interaction.channel
+        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
+            await interaction.response.send_message("Apenas o ADM responsável pode finalizar.", ephemeral=True)
+            return
+
+        channel = interaction.guild.get_channel(row["private_channel_id"])
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Canal inválido.", ephemeral=True)
             return
@@ -667,9 +845,113 @@ class MatchControlView(discord.ui.View):
             cur.execute("UPDATE matches SET status = 'finished' WHERE match_id = ?", (self.match_id,))
             conn.commit()
 
+        await update_pending_message_embed(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
+        await update_confirmation_message_status(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
+        await update_control_message(interaction.guild, self.match_id)
+
         await send_staff_log(interaction.guild, f"✅ Partida #{fmt_match_id(self.match_id)} finalizada por {interaction.user.mention}")
-        await update_pending_message_status(interaction.guild, self.match_id, "🔴 Finalizada")
-        await interaction.response.defer()
+        await interaction.response.send_message("Partida finalizada com sucesso.", ephemeral=True)
+
+    async def generate_pix_callback(self, interaction: discord.Interaction):
+        row = match_row(self.match_id)
+        if not row:
+            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
+            await interaction.response.send_message("Apenas o ADM responsável pode gerar cobrança.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(PixChargeModal(self.match_id))
+
+
+class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
+    def __init__(self, match_id: int):
+        super().__init__()
+        self.match_id = match_id
+
+        self.receiver_name = discord.ui.TextInput(
+            label="Nome do recebedor",
+            placeholder="Ex.: João Silva",
+            max_length=25,
+            required=True
+        )
+
+        self.pix_key = discord.ui.TextInput(
+            label="Chave Pix",
+            placeholder="CPF, e-mail, telefone ou chave aleatória",
+            max_length=77,
+            required=True
+        )
+
+        self.amount = discord.ui.TextInput(
+            label="Valor a receber",
+            placeholder="Ex.: 5,00",
+            max_length=20,
+            required=True
+        )
+
+        self.add_item(self.receiver_name)
+        self.add_item(self.pix_key)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        row = match_row(self.match_id)
+        if not row:
+            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
+            await interaction.response.send_message("Apenas o ADM responsável pode gerar cobrança.", ephemeral=True)
+            return
+
+        try:
+            amount_value = parse_decimal_brl(str(self.amount))
+        except (InvalidOperation, ValueError):
+            await interaction.response.send_message("Valor inválido. Use por exemplo: 5,00", ephemeral=True)
+            return
+
+        pix_key = str(self.pix_key).strip()
+        receiver_name = str(self.receiver_name).strip()
+
+        if not pix_key:
+            await interaction.response.send_message("A chave Pix é obrigatória.", ephemeral=True)
+            return
+
+        payload = build_pix_payload(
+            pix_key=pix_key,
+            receiver_name=receiver_name,
+            amount=amount_value,
+            city=PIX_CIDADE_PADRAO
+        )
+
+        qr_file = generate_qr_file(payload)
+        channel = interaction.guild.get_channel(row["private_channel_id"])
+
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("Canal da partida não encontrado.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"💳 Cobrança Pix - Partida #{fmt_match_id(self.match_id)}",
+            color=0x2ECC71,
+            description=(
+                f"👤 **Recebedor:** {receiver_name}\n"
+                f"🔑 **Chave Pix:** `{pix_key}`\n"
+                f"💸 **Valor:** {format_brl(amount_value)}\n\n"
+                f"**Pix copia e cola:**\n```{payload}```"
+            )
+        )
+        embed.set_image(url="attachment://pix_qrcode.png")
+        embed.set_footer(text="Envie o comprovante após realizar o pagamento.")
+
+        await channel.send(embed=embed, file=qr_file)
+        await send_staff_log(
+            interaction.guild,
+            f"💳 Cobrança Pix gerada na partida #{fmt_match_id(self.match_id)} por {interaction.user.mention} no valor de {format_brl(amount_value)}."
+        )
+
+        await interaction.response.send_message("Cobrança Pix enviada no canal da partida.", ephemeral=True)
 
 
 # =========================
@@ -772,7 +1054,7 @@ async def send_match_to_pending(guild: discord.Guild, match_id: int):
         return
 
     msg = await pending_channel.send(
-        embed=build_pending_match_embed(match_id),
+        embed=build_match_status_embed(match_id, "🟡 Aguardando ADM", 0x3498DB),
         view=ClaimMatchView(match_id)
     )
 
@@ -786,9 +1068,9 @@ async def send_match_to_pending(guild: discord.Guild, match_id: int):
 
     private_channel = guild.get_channel(row["private_channel_id"])
     if isinstance(private_channel, discord.TextChannel):
-        await private_channel.send("✅ Os dois jogadores confirmaram. Aguardando ADM assumir a partida.")
+        await private_channel.send("✅ Os jogadores confirmaram. Aguardando ADM assumir a partida.")
 
-    await update_confirmation_message_status(guild, match_id, "🟡 Aguardando ADM")
+    await update_confirmation_message_status(guild, match_id, "🟡 Aguardando ADM", 0x3498DB)
 
     bot.add_view(ClaimMatchView(match_id), message_id=msg.id)
     await send_staff_log(guild, f"📥 Partida #{fmt_match_id(match_id)} enviada para pendentes.")
@@ -822,11 +1104,12 @@ async def assume_match(guild: discord.Guild, adm: discord.Member, match_id: int)
     )
 
     control_msg = await private_channel.send(
-        f"🎮 **ADM assumiu a partida**\n"
+        f"🎮 **Painel da Partida #{fmt_match_id(match_id)}**\n"
         f"ADM responsável: {adm.mention}\n"
-        f"Jogadores: {mention_list_from_ids(players)}\n\n"
-        f"Use os botões abaixo para atualizar o status.",
-        view=MatchControlView(match_id)
+        f"Jogadores: {mention_list_from_ids(players)}\n"
+        f"Status atual: 🟡 Em preparação\n\n"
+        f"O ADM responsável pode abrir o painel privado no botão abaixo.",
+        view=AdminAccessView(match_id)
     )
 
     with closing(db_connect()) as conn:
@@ -840,8 +1123,12 @@ async def assume_match(guild: discord.Guild, adm: discord.Member, match_id: int)
         """, (adm.id, control_msg.id, match_id))
         conn.commit()
 
-    bot.add_view(MatchControlView(match_id), message_id=control_msg.id)
-    await update_pending_message_as_claimed(guild, match_id, adm)
+    bot.add_view(AdminAccessView(match_id), message_id=control_msg.id)
+
+    await update_pending_message_embed(guild, match_id, "🟡 Em preparação", 0xF1C40F)
+    await update_confirmation_message_status(guild, match_id, "🟡 Em preparação", 0xF1C40F)
+
+    await private_channel.send(f"✅ {adm.mention} assumiu a partida. O painel de controle foi liberado para o ADM responsável.")
     await send_staff_log(guild, f"🙋 Partida #{fmt_match_id(match_id)} assumida por {adm.mention}.")
 
 
@@ -896,6 +1183,7 @@ async def on_ready():
     with closing(db_connect()) as conn:
         cur = conn.cursor()
 
+        # Painéis antigos continuam funcionando
         cur.execute("SELECT panel_id FROM panels")
         for row in cur.fetchall():
             try:
@@ -903,6 +1191,7 @@ async def on_ready():
             except Exception:
                 pass
 
+        # Partidas aguardando confirmação
         cur.execute("""
             SELECT match_id, confirmation_message_id
             FROM matches
@@ -914,6 +1203,7 @@ async def on_ready():
             except Exception:
                 pass
 
+        # Partidas pendentes de ADM
         cur.execute("""
             SELECT match_id, pending_message_id
             FROM matches
@@ -925,14 +1215,15 @@ async def on_ready():
             except Exception:
                 pass
 
+        # Partidas assumidas ou em andamento
         cur.execute("""
             SELECT match_id, control_message_id
             FROM matches
-            WHERE status IN ('claimed', 'in_progress', 'finished') AND control_message_id IS NOT NULL
+            WHERE status IN ('claimed', 'in_progress') AND control_message_id IS NOT NULL
         """)
         for row in cur.fetchall():
             try:
-                bot.add_view(MatchControlView(row["match_id"]), message_id=row["control_message_id"])
+                bot.add_view(AdminAccessView(row["match_id"]), message_id=row["control_message_id"])
             except Exception:
                 pass
 
