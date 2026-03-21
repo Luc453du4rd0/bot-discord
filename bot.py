@@ -1131,6 +1131,177 @@ async def assume_match(guild: discord.Guild, adm: discord.Member, match_id: int)
     await private_channel.send(f"✅ {adm.mention} assumiu a partida. O painel de controle foi liberado para o ADM responsável.")
     await send_staff_log(guild, f"🙋 Partida #{fmt_match_id(match_id)} assumida por {adm.mention}.")
 
+async def handle_panel_join(interaction: discord.Interaction, panel_id: str):
+    panel = panel_row(panel_id)
+    if not panel:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Painel não encontrado.", ephemeral=True)
+        return
+
+    if active_match_for_panel(panel_id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Já existe uma partida desse painel em andamento ou pendente.", ephemeral=True)
+        return
+
+    uid = str(interaction.user.id)
+    players = panel_players(panel_id)
+
+    if uid in players:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Você já está nessa fila.", ephemeral=True)
+        return
+
+    if len(players) >= panel["max_players"]:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Fila cheia.", ephemeral=True)
+        return
+
+    with closing(db_connect()) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO panel_players (panel_id, user_id) VALUES (?, ?)", (panel_id, uid))
+        conn.commit()
+
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+
+    await refresh_panel_message(panel_id)
+
+    players = panel_players(panel_id)
+    if len(players) == panel["max_players"]:
+        await create_match_confirmation_room(interaction.guild, panel_id)
+
+
+async def handle_panel_leave(interaction: discord.Interaction, panel_id: str):
+    panel = panel_row(panel_id)
+    if not panel:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Painel não encontrado.", ephemeral=True)
+        return
+
+    uid = str(interaction.user.id)
+    players = panel_players(panel_id)
+
+    if uid not in players:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
+        return
+
+    with closing(db_connect()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM panel_players WHERE panel_id = ? AND user_id = ?", (panel_id, uid))
+        conn.commit()
+
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+
+    await refresh_panel_message(panel_id)
+
+
+async def handle_claim_match(interaction: discord.Interaction, match_id: int):
+    row = match_row(match_id)
+    if not row:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
+        return
+
+    if row["status"] != "pending":
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Essa partida já foi assumida.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not is_adm_member(interaction.user):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Apenas ADMs podem assumir partidas.", ephemeral=True)
+        return
+
+    await assume_match(interaction.guild, interaction.user, match_id)
+
+    if not interaction.response.is_done():
+        await interaction.response.send_message(
+            f"Você assumiu a partida #{fmt_match_id(match_id)}. O painel privado foi liberado para você no canal da partida.",
+            ephemeral=True
+        )
+
+
+async def handle_confirm_match(interaction: discord.Interaction, match_id: int):
+    row = match_row(match_id)
+    if not row:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
+        return
+
+    if row["status"] != "awaiting_confirmation":
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Essa partida não está mais aguardando confirmação.", ephemeral=True)
+        return
+
+    uid = str(interaction.user.id)
+    players = json.loads(row["players_json"])
+
+    if uid not in players:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Você não faz parte dessa partida.", ephemeral=True)
+        return
+
+    confirmed = json.loads(row["confirmed_players_json"])
+    if uid in confirmed:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Você já confirmou.", ephemeral=True)
+        return
+
+    confirmed.append(uid)
+
+    with closing(db_connect()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE matches SET confirmed_players_json = ? WHERE match_id = ?",
+            (json.dumps(confirmed), match_id)
+        )
+        conn.commit()
+
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+
+    await refresh_confirmation_message(interaction.guild, match_id)
+
+    if len(confirmed) == len(players):
+        await send_match_to_pending(interaction.guild, match_id)
+
+
+async def handle_cancel_match(interaction: discord.Interaction, match_id: int):
+    row = match_row(match_id)
+    if not row:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
+        return
+
+    if row["status"] != "awaiting_confirmation":
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Essa partida não pode mais ser cancelada.", ephemeral=True)
+        return
+
+    uid = str(interaction.user.id)
+    players = json.loads(row["players_json"])
+
+    if uid not in players:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Você não faz parte dessa partida.", ephemeral=True)
+        return
+
+    with closing(db_connect()) as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE matches SET status = 'cancelled' WHERE match_id = ?", (match_id,))
+        conn.commit()
+
+    channel = interaction.guild.get_channel(row["private_channel_id"])
+    if isinstance(channel, discord.TextChannel):
+        await channel.send("❌ A partida foi cancelada por um dos jogadores.")
+        await channel.edit(name=f"cancelada-{fmt_match_id(match_id)}")
+
+    await send_staff_log(interaction.guild, f"❌ Partida #{fmt_match_id(match_id)} cancelada por <@{uid}>.")
+
+    if not interaction.response.is_done():
+        await interaction.response.defer()
 
 # =========================
 # COMMANDS
@@ -1176,6 +1347,50 @@ async def painelz(ctx, titulo: str, modo: str, info: str):
 # =========================
 # READY
 # =========================
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+
+    data = interaction.data or {}
+    custom_id = data.get("custom_id")
+
+    if not custom_id:
+        return
+
+    try:
+        if custom_id.startswith("panel_join_"):
+            panel_id = custom_id.replace("panel_join_", "", 1)
+            await handle_panel_join(interaction, panel_id)
+            return
+
+        if custom_id.startswith("panel_leave_"):
+            panel_id = custom_id.replace("panel_leave_", "", 1)
+            await handle_panel_leave(interaction, panel_id)
+            return
+
+        if custom_id.startswith("claim_match_"):
+            match_id = int(custom_id.replace("claim_match_", "", 1))
+            await handle_claim_match(interaction, match_id)
+            return
+
+        if custom_id.startswith("confirm_match_"):
+            match_id = int(custom_id.replace("confirm_match_", "", 1))
+            await handle_confirm_match(interaction, match_id)
+            return
+
+        if custom_id.startswith("cancel_match_"):
+            match_id = int(custom_id.replace("cancel_match_", "", 1))
+            await handle_cancel_match(interaction, match_id)
+            return
+
+    except Exception as e:
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"Erro ao processar interação: {e}", ephemeral=True)
+        except Exception:
+            pass
+
 @bot.event
 async def on_ready():
     db_init()
