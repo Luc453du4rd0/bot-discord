@@ -25,7 +25,6 @@ NOME_CARGO_ADM = "ADM"
 NOME_CATEGORIA_EM_ANDAMENTO = "EM ANDAMENTO"
 NOME_CATEGORIA_FINALIZADAS = "FINALIZADAS"
 
-# Cidade fixa do BR Code Pix (não vai no formulário)
 PIX_CIDADE_PADRAO = "TAVARES"
 
 DB_FILE = "bot_data.sqlite3"
@@ -85,6 +84,7 @@ def db_init():
         CREATE TABLE IF NOT EXISTS panel_players (
             panel_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
+            selected_option TEXT,
             PRIMARY KEY(panel_id, user_id)
         )
         """)
@@ -104,7 +104,11 @@ def db_init():
             pending_message_id INTEGER,
             control_message_id INTEGER,
             confirmation_message_id INTEGER,
-            claimed_by INTEGER
+            claimed_by INTEGER,
+            players_details_json TEXT,
+            charge_amount TEXT,
+            pix_receiver_name TEXT,
+            pix_key TEXT
         )
         """)
 
@@ -115,12 +119,11 @@ def db_init():
 
         conn.commit()
 
-    # Migrações simples para compatibilidade
-    ensure_column_exists("matches", "claimed_by", "INTEGER")
-    ensure_column_exists("matches", "control_message_id", "INTEGER")
-    ensure_column_exists("matches", "pending_message_id", "INTEGER")
-    ensure_column_exists("matches", "confirmation_message_id", "INTEGER")
-    ensure_column_exists("matches", "private_channel_id", "INTEGER")
+    ensure_column_exists("panel_players", "selected_option", "TEXT")
+    ensure_column_exists("matches", "players_details_json", "TEXT")
+    ensure_column_exists("matches", "charge_amount", "TEXT")
+    ensure_column_exists("matches", "pix_receiver_name", "TEXT")
+    ensure_column_exists("matches", "pix_key", "TEXT")
 
 
 def get_counter() -> int:
@@ -146,29 +149,21 @@ def fmt_match_id(match_id: int) -> str:
     return str(match_id).zfill(6)
 
 
-def find_role(guild: discord.Guild, role_name: str):
-    return discord.utils.get(guild.roles, name=role_name)
-
-
 def find_category(guild: discord.Guild, category_name: str):
     return discord.utils.get(guild.categories, name=category_name)
 
 
 def define_max_players(mode: str) -> int:
     mode_clean = mode.lower().strip()
-    if mode_clean in ["1x1", "1v1"]:
+    if "1x1" in mode_clean or "1v1" in mode_clean:
         return 2
-    if mode_clean in ["2x2", "2v2"]:
+    if "2x2" in mode_clean or "2v2" in mode_clean:
         return 4
-    if mode_clean in ["3x3", "3v3"]:
+    if "3x3" in mode_clean or "3v3" in mode_clean:
         return 6
-    if mode_clean in ["4x4", "4v4"]:
+    if "4x4" in mode_clean or "4v4" in mode_clean:
         return 8
     return 2
-
-
-def mention_list_from_ids(user_ids: list[str]) -> str:
-    return " vs ".join([f"<@{uid}>" for uid in user_ids])
 
 
 def is_adm_member(member: discord.Member) -> bool:
@@ -182,11 +177,16 @@ def panel_row(panel_id: str):
         return cur.fetchone()
 
 
-def panel_players(panel_id: str) -> list[str]:
+def panel_players(panel_id: str) -> list[dict]:
     with closing(db_connect()) as conn:
         cur = conn.cursor()
-        cur.execute("SELECT user_id FROM panel_players WHERE panel_id = ? ORDER BY rowid ASC", (panel_id,))
-        return [r["user_id"] for r in cur.fetchall()]
+        cur.execute("""
+            SELECT user_id, COALESCE(selected_option, '') AS selected_option
+            FROM panel_players
+            WHERE panel_id = ?
+            ORDER BY rowid ASC
+        """, (panel_id,))
+        return [{"user_id": r["user_id"], "selected_option": r["selected_option"]} for r in cur.fetchall()]
 
 
 def match_row(match_id: int):
@@ -196,14 +196,49 @@ def match_row(match_id: int):
         return cur.fetchone()
 
 
-def active_match_for_panel(panel_id: str) -> bool:
-    with closing(db_connect()) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM matches WHERE panel_id = ? AND status IN ('awaiting_confirmation', 'pending', 'claimed', 'in_progress') LIMIT 1",
-            (panel_id,)
-        )
-        return cur.fetchone() is not None
+def get_match_players_details(row) -> list[dict]:
+    if row["players_details_json"]:
+        try:
+            data = json.loads(row["players_details_json"])
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+
+    try:
+        players = json.loads(row["players_json"])
+    except Exception:
+        players = []
+
+    return [{"user_id": uid, "selected_option": ""} for uid in players]
+
+
+def build_players_display_from_details(details: list[dict]) -> str:
+    if not details:
+        return "Nenhum jogador"
+    lines = []
+    for item in details:
+        uid = item.get("user_id")
+        selected = (item.get("selected_option") or "").strip()
+        if selected:
+            lines.append(f"<@{uid}> — {selected}")
+        else:
+            lines.append(f"<@{uid}>")
+    return "\n".join(lines)
+
+
+def build_players_vs_from_details(details: list[dict]) -> str:
+    if not details:
+        return "Nenhum jogador"
+    parts = []
+    for item in details:
+        uid = item.get("user_id")
+        selected = (item.get("selected_option") or "").strip()
+        if selected:
+            parts.append(f"<@{uid}> ({selected})")
+        else:
+            parts.append(f"<@{uid}>")
+    return " vs ".join(parts)
 
 
 def parse_decimal_brl(value_str: str) -> Decimal:
@@ -216,7 +251,15 @@ def parse_decimal_brl(value_str: str) -> Decimal:
 
 
 def format_brl(value: Decimal) -> str:
-    return f"R$ {str(value.quantize(Decimal('0.01'))).replace('.', ',')}"
+    return f"{str(value.quantize(Decimal('0.01'))).replace('.', ',')}"
+
+
+def safe_channel_name(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace(" ", "-")
+    text = re.sub(r"[^a-z0-9,\-]", "", text)
+    text = re.sub(r"-{2,}", "-", text)
+    return text[:95] if text else "canal"
 
 
 def normalize_pix_name(name: str) -> str:
@@ -262,15 +305,15 @@ def build_pix_payload(pix_key: str, receiver_name: str, amount: Decimal, city: s
     additional_data = emv("05", "***")
 
     payload = (
-        emv("00", "01") +                     # Payload Format Indicator
-        emv("26", merchant_account_info) +   # Merchant Account Information
-        emv("52", "0000") +                  # Merchant Category Code
-        emv("53", "986") +                   # Currency BRL
-        emv("54", amount_str) +              # Amount
-        emv("58", "BR") +                    # Country Code
-        emv("59", receiver_name) +           # Merchant Name
-        emv("60", city) +                    # Merchant City
-        emv("62", additional_data) +         # Additional Data Field
+        emv("00", "01") +
+        emv("26", merchant_account_info) +
+        emv("52", "0000") +
+        emv("53", "986") +
+        emv("54", amount_str) +
+        emv("58", "BR") +
+        emv("59", receiver_name) +
+        emv("60", city) +
+        emv("62", additional_data) +
         "6304"
     )
 
@@ -290,15 +333,47 @@ def generate_qr_file(payload: str, filename: str = "pix_qrcode.png") -> discord.
     return discord.File(buffer, filename=filename)
 
 
+def panel_option_labels(mode: str) -> list[str]:
+    mode_clean = mode.lower()
+
+    if "mista" in mode_clean:
+        return ["1 emulador", "2 emuladores", "3 emuladores"]
+
+    if "mobile" in mode_clean or "móbile" in mode_clean:
+        return ["Gelo normal", "Gelo infinito"]
+
+    if "emulador" in mode_clean:
+        return ["Gelo normal", "Gelo infinito"]
+
+    return ["Entrar na fila"]
+
+
 def can_manage_match(member: discord.Member, row) -> bool:
+    if member.guild.owner_id == member.id:
+        return True
+
     if not is_adm_member(member):
         return False
 
     claimed_by = row["claimed_by"]
     if claimed_by is None:
-        return True
+        return False
 
     return int(claimed_by) == member.id
+
+
+def status_text(row) -> str:
+    mapping = {
+        "awaiting_confirmation": "Aguardando confirmação",
+        "pending": "Aguardando ADM",
+        "claimed": "Em preparação",
+        "in_progress": "Em andamento",
+        "payment_pending": "Aguardando confirmação de pagamento",
+        "payment_confirmed": "Pagamento confirmado",
+        "finished": "Finalizada",
+        "cancelled": "Cancelada"
+    }
+    return mapping.get(row["status"], row["status"])
 
 
 async def send_staff_log(guild: discord.Guild, text: str):
@@ -313,7 +388,7 @@ async def send_staff_log(guild: discord.Guild, text: str):
 def build_panel_embed(panel_id: str) -> discord.Embed:
     panel = panel_row(panel_id)
     players = panel_players(panel_id)
-    players_text = "\n".join([f"<@{uid}>" for uid in players]) if players else "Nenhum jogador na fila"
+    players_text = build_players_display_from_details(players) if players else "Nenhum jogador na fila"
 
     embed = discord.Embed(title=panel["title"], color=0x2ECC71)
     embed.description = (
@@ -327,15 +402,18 @@ def build_panel_embed(panel_id: str) -> discord.Embed:
 
 def build_confirmation_embed(match_id: int) -> discord.Embed:
     row = match_row(match_id)
-    players = json.loads(row["players_json"])
+    details = get_match_players_details(row)
     confirmed = json.loads(row["confirmed_players_json"])
 
     status_lines = []
-    for uid in players:
+    for item in details:
+        uid = item["user_id"]
+        option = (item.get("selected_option") or "").strip()
+        option_text = f" ({option})" if option else ""
         if uid in confirmed:
-            status_lines.append(f"✅ <@{uid}> confirmou")
+            status_lines.append(f"✅ <@{uid}>{option_text} confirmou")
         else:
-            status_lines.append(f"⏳ <@{uid}> aguardando")
+            status_lines.append(f"⏳ <@{uid}>{option_text} aguardando")
 
     embed = discord.Embed(
         title=f"Partida #{fmt_match_id(match_id)}",
@@ -343,7 +421,7 @@ def build_confirmation_embed(match_id: int) -> discord.Embed:
         description=(
             f"🎮 **Modo:** {row['mode']}\n"
             f"💸 **Valor:** {row['info']}\n"
-            f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
+            f"👤 **Jogadores:**\n{build_players_display_from_details(details)}\n\n"
             f"📌 **Status:** Aguardando confirmação\n\n"
             + "\n".join(status_lines)
         )
@@ -351,11 +429,30 @@ def build_confirmation_embed(match_id: int) -> discord.Embed:
     return embed
 
 
-def build_match_status_embed(match_id: int, status_text: str, color: int, adm_mention: str | None = None) -> discord.Embed:
+def build_pending_match_embed(match_id: int) -> discord.Embed:
     row = match_row(match_id)
-    players = json.loads(row["players_json"])
+    details = get_match_players_details(row)
 
-    extra = f"\n✅ **Assumida por:** {adm_mention}" if adm_mention else ""
+    embed = discord.Embed(
+        title=f"Partida #{fmt_match_id(match_id)}",
+        color=0x3498DB,
+        description=(
+            f"🎮 **Modo:** {row['mode']}\n"
+            f"💸 **Valor:** {row['info']}\n"
+            f"👤 **Jogadores:**\n{build_players_display_from_details(details)}\n\n"
+            f"📌 **Status:** 🟡 Aguardando ADM"
+        )
+    )
+    return embed
+
+
+def build_match_status_embed(match_id: int, status_label: str, color: int) -> discord.Embed:
+    row = match_row(match_id)
+    details = get_match_players_details(row)
+
+    adm_text = ""
+    if row["claimed_by"]:
+        adm_text = f"\n✅ **ADM responsável:** <@{row['claimed_by']}>"
 
     embed = discord.Embed(
         title=f"Partida #{fmt_match_id(match_id)}",
@@ -363,9 +460,9 @@ def build_match_status_embed(match_id: int, status_text: str, color: int, adm_me
         description=(
             f"🎮 **Modo:** {row['mode']}\n"
             f"💸 **Valor:** {row['info']}\n"
-            f"👤 **Jogadores:** {mention_list_from_ids(players)}"
-            f"{extra}\n"
-            f"📌 **Status:** {status_text}"
+            f"👤 **Jogadores:**\n{build_players_display_from_details(details)}"
+            f"{adm_text}\n\n"
+            f"📌 **Status:** {status_label}"
         )
     )
     return embed
@@ -389,7 +486,8 @@ async def refresh_panel_message(panel_id: str):
 
     try:
         msg = await channel.fetch_message(int(panel_id))
-        await msg.edit(embed=build_panel_embed(panel_id), view=PanelQueueView(panel_id))
+        view = PanelQueueView(panel_id)
+        await msg.edit(embed=build_panel_embed(panel_id), view=view)
     except discord.NotFound:
         pass
 
@@ -410,7 +508,7 @@ async def refresh_confirmation_message(guild: discord.Guild, match_id: int):
         pass
 
 
-async def update_confirmation_message_status(guild: discord.Guild, match_id: int, status: str, color: int = 0x2ECC71):
+async def update_confirmation_message_status(guild: discord.Guild, match_id: int, status: str, color: int):
     row = match_row(match_id)
     if not row or not row["confirmation_message_id"] or not row["private_channel_id"]:
         return
@@ -421,18 +519,19 @@ async def update_confirmation_message_status(guild: discord.Guild, match_id: int
 
     try:
         msg = await channel.fetch_message(row["confirmation_message_id"])
-        players = json.loads(row["players_json"])
+        details = get_match_players_details(row)
 
-        adm_mention = f"<@{row['claimed_by']}>" if row["claimed_by"] else None
+        adm_line = f"\n✅ **ADM responsável:** <@{row['claimed_by']}>" if row["claimed_by"] else ""
+
         embed = discord.Embed(
             title=f"Partida #{fmt_match_id(match_id)}",
             color=color,
             description=(
                 f"🎮 **Modo:** {row['mode']}\n"
                 f"💸 **Valor:** {row['info']}\n"
-                f"👤 **Jogadores:** {mention_list_from_ids(players)}\n"
-                + (f"✅ **Assumida por:** {adm_mention}\n" if adm_mention else "")
-                + f"📌 **Status:** {status}"
+                f"👤 **Jogadores:**\n{build_players_display_from_details(details)}"
+                f"{adm_line}\n\n"
+                f"📌 **Status:** {status}"
             )
         )
 
@@ -441,7 +540,7 @@ async def update_confirmation_message_status(guild: discord.Guild, match_id: int
         pass
 
 
-async def update_pending_message_embed(guild: discord.Guild, match_id: int, status: str, color: int, remove_view: bool = True):
+async def update_pending_message_status(guild: discord.Guild, match_id: int, status: str, color: int, remove_view: bool = True):
     row = match_row(match_id)
     if not row or not row["pending_message_id"]:
         return
@@ -452,48 +551,11 @@ async def update_pending_message_embed(guild: discord.Guild, match_id: int, stat
 
     try:
         msg = await channel.fetch_message(row["pending_message_id"])
-        adm_mention = f"<@{row['claimed_by']}>" if row["claimed_by"] else None
-        embed = build_match_status_embed(match_id, status, color, adm_mention=adm_mention)
-        await msg.edit(embed=embed, view=None if remove_view else ClaimMatchView(match_id))
+        embed = build_match_status_embed(match_id, status, color)
+        view = None if remove_view else ClaimMatchView(match_id)
+        await msg.edit(embed=embed, view=view)
     except discord.NotFound:
         pass
-
-
-async def update_control_message(guild: discord.Guild, match_id: int):
-    row = match_row(match_id)
-    if not row or not row["control_message_id"] or not row["private_channel_id"]:
-        return
-
-    channel = guild.get_channel(row["private_channel_id"])
-    if not isinstance(channel, discord.TextChannel):
-        return
-
-    try:
-        msg = await channel.fetch_message(row["control_message_id"])
-    except discord.NotFound:
-        return
-
-    status_map = {
-        "claimed": "🟡 Em preparação",
-        "in_progress": "🔴 Em andamento",
-        "finished": "✅ Finalizada"
-    }
-    status_text = status_map.get(row["status"], row["status"])
-    players = json.loads(row["players_json"])
-    adm_mention = f"<@{row['claimed_by']}>" if row["claimed_by"] else "Não definido"
-
-    content = (
-        f"🎮 **Painel da Partida #{fmt_match_id(match_id)}**\n"
-        f"ADM responsável: {adm_mention}\n"
-        f"Jogadores: {mention_list_from_ids(players)}\n"
-        f"Status atual: {status_text}\n\n"
-        f"O ADM responsável pode abrir o painel privado no botão abaixo."
-    )
-
-    if row["status"] == "finished":
-        await msg.edit(content=content, view=None)
-    else:
-        await msg.edit(content=content, view=AdminAccessView(match_id))
 
 
 # =========================
@@ -504,56 +566,61 @@ class PanelQueueView(discord.ui.View):
         super().__init__(timeout=None)
         self.panel_id = panel_id
 
-        join_btn = discord.ui.Button(
-            label="Entrar na fila",
-            style=discord.ButtonStyle.success,
-            custom_id=f"panel_join_{panel_id}"
-        )
+        panel = panel_row(panel_id)
+        options = panel_option_labels(panel["mode"]) if panel else ["Entrar na fila"]
+
+        for index, label in enumerate(options):
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.success,
+                custom_id=f"panel_join_{panel_id}_{index}"
+            )
+            btn.callback = self.make_join_callback(label)
+            self.add_item(btn)
+
         leave_btn = discord.ui.Button(
             label="Sair da fila",
             style=discord.ButtonStyle.danger,
             emoji="🔻",
             custom_id=f"panel_leave_{panel_id}"
         )
-
-        join_btn.callback = self.join_callback
         leave_btn.callback = self.leave_callback
-
-        self.add_item(join_btn)
         self.add_item(leave_btn)
 
-    async def join_callback(self, interaction: discord.Interaction):
-        panel = panel_row(self.panel_id)
-        if not panel:
-            await interaction.response.send_message("Painel não encontrado.", ephemeral=True)
-            return
+    def make_join_callback(self, selected_label: str):
+        async def callback(interaction: discord.Interaction):
+            panel = panel_row(self.panel_id)
+            if not panel:
+                await interaction.response.send_message("Painel não encontrado.", ephemeral=True)
+                return
 
-        if active_match_for_panel(self.panel_id):
-            await interaction.response.send_message("Já existe uma partida desse painel em andamento ou pendente.", ephemeral=True)
-            return
+            uid = str(interaction.user.id)
+            players = panel_players(self.panel_id)
 
-        uid = str(interaction.user.id)
-        players = panel_players(self.panel_id)
+            if any(p["user_id"] == uid for p in players):
+                await interaction.response.send_message("Você já está nessa fila.", ephemeral=True)
+                return
 
-        if uid in players:
-            await interaction.response.send_message("Você já está nessa fila.", ephemeral=True)
-            return
+            if len(players) >= panel["max_players"]:
+                await interaction.response.send_message("Fila cheia.", ephemeral=True)
+                return
 
-        if len(players) >= panel["max_players"]:
-            await interaction.response.send_message("Fila cheia.", ephemeral=True)
-            return
+            with closing(db_connect()) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO panel_players (panel_id, user_id, selected_option) VALUES (?, ?, ?)",
+                    (self.panel_id, uid, selected_label)
+                )
+                conn.commit()
 
-        with closing(db_connect()) as conn:
-            cur = conn.cursor()
-            cur.execute("INSERT INTO panel_players (panel_id, user_id) VALUES (?, ?)", (self.panel_id, uid))
-            conn.commit()
+            await interaction.response.defer()
+            await refresh_panel_message(self.panel_id)
 
-        await interaction.response.defer()
-        await refresh_panel_message(self.panel_id)
+            updated_players = panel_players(self.panel_id)
+            if len(updated_players) == panel["max_players"]:
+                await create_match_confirmation_room(interaction.guild, self.panel_id)
 
-        players = panel_players(self.panel_id)
-        if len(players) == panel["max_players"]:
-            await create_match_confirmation_room(interaction.guild, self.panel_id)
+        return callback
 
     async def leave_callback(self, interaction: discord.Interaction):
         panel = panel_row(self.panel_id)
@@ -564,7 +631,7 @@ class PanelQueueView(discord.ui.View):
         uid = str(interaction.user.id)
         players = panel_players(self.panel_id)
 
-        if uid not in players:
+        if not any(p["user_id"] == uid for p in players):
             await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
             return
 
@@ -610,9 +677,10 @@ class PlayerConfirmationView(discord.ui.View):
             return
 
         uid = str(interaction.user.id)
-        players = json.loads(row["players_json"])
+        details = get_match_players_details(row)
+        players_ids = [p["user_id"] for p in details]
 
-        if uid not in players:
+        if uid not in players_ids:
             await interaction.response.send_message("Você não faz parte dessa partida.", ephemeral=True)
             return
 
@@ -634,7 +702,7 @@ class PlayerConfirmationView(discord.ui.View):
         await interaction.response.defer()
         await refresh_confirmation_message(interaction.guild, self.match_id)
 
-        if len(confirmed) == len(players):
+        if len(confirmed) == len(players_ids):
             await send_match_to_pending(interaction.guild, self.match_id)
 
     async def cancel_callback(self, interaction: discord.Interaction):
@@ -648,9 +716,10 @@ class PlayerConfirmationView(discord.ui.View):
             return
 
         uid = str(interaction.user.id)
-        players = json.loads(row["players_json"])
+        details = get_match_players_details(row)
+        players_ids = [p["user_id"] for p in details]
 
-        if uid not in players:
+        if uid not in players_ids:
             await interaction.response.send_message("Você não faz parte dessa partida.", ephemeral=True)
             return
 
@@ -698,48 +767,15 @@ class ClaimMatchView(discord.ui.View):
         await assume_match(interaction.guild, interaction.user, self.match_id)
 
         await interaction.response.send_message(
-            f"Você assumiu a partida #{fmt_match_id(self.match_id)}. O painel privado foi liberado para você no canal da partida.",
-            ephemeral=True
-        )
-
-
-class AdminAccessView(discord.ui.View):
-    def __init__(self, match_id: int):
-        super().__init__(timeout=None)
-        self.match_id = match_id
-
-        open_btn = discord.ui.Button(
-            label="Abrir painel ADM",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"open_admin_panel_{match_id}"
-        )
-        open_btn.callback = self.open_callback
-        self.add_item(open_btn)
-
-    async def open_callback(self, interaction: discord.Interaction):
-        row = match_row(self.match_id)
-        if not row:
-            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-            return
-
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Usuário inválido.", ephemeral=True)
-            return
-
-        if not can_manage_match(interaction.user, row):
-            await interaction.response.send_message("Apenas o ADM responsável pode usar esse painel.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            f"Painel privado da partida #{fmt_match_id(self.match_id)}:",
+            f"🎮 **Painel da partida #{fmt_match_id(self.match_id)}**",
             ephemeral=True,
-            view=AdminEphemeralControlView(self.match_id)
+            view=AdminFlowView(self.match_id)
         )
 
 
-class AdminEphemeralControlView(discord.ui.View):
+class AdminFlowView(discord.ui.View):
     def __init__(self, match_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=900)
         self.match_id = match_id
 
         row = match_row(match_id)
@@ -755,7 +791,7 @@ class AdminEphemeralControlView(discord.ui.View):
             start_btn.callback = self.start_callback
             self.add_item(start_btn)
 
-        if row["status"] in ("claimed", "in_progress"):
+        elif row["status"] == "in_progress":
             pix_btn = discord.ui.Button(
                 label="Gerar cobrança",
                 style=discord.ButtonStyle.secondary,
@@ -764,7 +800,16 @@ class AdminEphemeralControlView(discord.ui.View):
             pix_btn.callback = self.generate_pix_callback
             self.add_item(pix_btn)
 
-        if row["status"] == "in_progress":
+        elif row["status"] == "payment_pending":
+            paid_btn = discord.ui.Button(
+                label="Confirmar pagamento",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"confirm_payment_{match_id}"
+            )
+            paid_btn.callback = self.confirm_payment_callback
+            self.add_item(paid_btn)
+
+        elif row["status"] == "payment_confirmed":
             finish_btn = discord.ui.Button(
                 label="Finalizar",
                 style=discord.ButtonStyle.danger,
@@ -773,23 +818,27 @@ class AdminEphemeralControlView(discord.ui.View):
             finish_btn.callback = self.finish_callback
             self.add_item(finish_btn)
 
-    async def start_callback(self, interaction: discord.Interaction):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         row = match_row(self.match_id)
         if not row:
             await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-            return
+            return False
 
-        if row["status"] != "claimed":
-            await interaction.response.send_message("Essa partida não está em preparação.", ephemeral=True)
-            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Usuário inválido.", ephemeral=True)
+            return False
 
-        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
-            await interaction.response.send_message("Apenas o ADM responsável pode iniciar.", ephemeral=True)
-            return
+        if not can_manage_match(interaction.user, row):
+            await interaction.response.send_message("Apenas o ADM responsável ou o dono do servidor podem usar esse painel.", ephemeral=True)
+            return False
 
+        return True
+
+    async def start_callback(self, interaction: discord.Interaction):
+        row = match_row(self.match_id)
         channel = interaction.guild.get_channel(row["private_channel_id"])
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Canal da partida não encontrado.", ephemeral=True)
+            await interaction.response.send_message("Canal inválido.", ephemeral=True)
             return
 
         await channel.edit(name=f"em-andamento-{fmt_match_id(self.match_id)}")
@@ -799,44 +848,92 @@ class AdminEphemeralControlView(discord.ui.View):
             cur.execute("UPDATE matches SET status = 'in_progress' WHERE match_id = ?", (self.match_id,))
             conn.commit()
 
-        await update_pending_message_embed(interaction.guild, self.match_id, "🔴 Em andamento", 0xE74C3C)
+        await update_pending_message_status(interaction.guild, self.match_id, "🔴 Em andamento", 0xE74C3C)
         await update_confirmation_message_status(interaction.guild, self.match_id, "🔴 Em andamento", 0xE74C3C)
-        await update_control_message(interaction.guild, self.match_id)
-
         await send_staff_log(interaction.guild, f"▶️ Partida #{fmt_match_id(self.match_id)} iniciada por {interaction.user.mention}")
-        await interaction.response.send_message("Partida iniciada com sucesso.", ephemeral=True)
 
-    async def finish_callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=f"🎮 **Partida #{fmt_match_id(self.match_id)}**\nAgora gere a cobrança para os jogadores.",
+            view=AdminFlowView(self.match_id)
+        )
+
+    async def generate_pix_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(PixChargeModal(self.match_id))
+
+    async def confirm_payment_callback(self, interaction: discord.Interaction):
         row = match_row(self.match_id)
-        if not row:
-            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-            return
-
-        if row["status"] != "in_progress":
-            await interaction.response.send_message("Essa partida não está em andamento.", ephemeral=True)
-            return
-
-        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
-            await interaction.response.send_message("Apenas o ADM responsável pode finalizar.", ephemeral=True)
-            return
-
         channel = interaction.guild.get_channel(row["private_channel_id"])
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Canal inválido.", ephemeral=True)
             return
 
-        players = json.loads(row["players_json"])
+        charge_amount = row["charge_amount"]
+        if not charge_amount:
+            await interaction.response.send_message("Nenhuma cobrança foi gerada ainda.", ephemeral=True)
+            return
+
+        try:
+            amount_each = parse_decimal_brl(charge_amount)
+        except Exception:
+            await interaction.response.send_message("Valor da cobrança inválido.", ephemeral=True)
+            return
+
+        details = get_match_players_details(row)
+        payout = amount_each * Decimal(len(details))
+        payout_str = format_brl(payout)
+
+        await channel.edit(name=safe_channel_name(f"pagar-{payout_str}"))
+
+        with closing(db_connect()) as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE matches SET status = 'payment_confirmed' WHERE match_id = ?", (self.match_id,))
+            conn.commit()
+
+        await update_pending_message_status(interaction.guild, self.match_id, f"🟢 Pagamento confirmado • pagar {payout_str}", 0x2ECC71)
+        await update_confirmation_message_status(interaction.guild, self.match_id, f"🟢 Pagamento confirmado • pagar {payout_str}", 0x2ECC71)
+        await send_staff_log(interaction.guild, f"💰 Pagamento confirmado na partida #{fmt_match_id(self.match_id)} por {interaction.user.mention}.")
+
+        await interaction.response.edit_message(
+            content=(
+                f"🎮 **Partida #{fmt_match_id(self.match_id)}**\n"
+                f"⚠️ **Finalize somente após a partida terminar e o pagamento do vencedor ser realizado.**"
+            ),
+            view=AdminFlowView(self.match_id)
+        )
+
+    async def finish_callback(self, interaction: discord.Interaction):
+        row = match_row(self.match_id)
+        channel = interaction.guild.get_channel(row["private_channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("Canal inválido.", ephemeral=True)
+            return
+
         final_cat = find_category(interaction.guild, NOME_CATEGORIA_FINALIZADAS)
-
         if final_cat:
-            await channel.edit(name=f"finalizada-{fmt_match_id(self.match_id)}", category=final_cat)
+            await channel.edit(name=f"finalizados-{fmt_match_id(self.match_id)}", category=final_cat)
         else:
-            await channel.edit(name=f"finalizada-{fmt_match_id(self.match_id)}")
+            await channel.edit(name=f"finalizados-{fmt_match_id(self.match_id)}")
 
-        for uid in players:
-            member = interaction.guild.get_member(int(uid))
+        details = get_match_players_details(row)
+
+        for item in details:
+            member = interaction.guild.get_member(int(item["user_id"]))
             if member:
                 await channel.set_permissions(member, overwrite=None)
+
+        if row["claimed_by"]:
+            adm_member = interaction.guild.get_member(int(row["claimed_by"]))
+            if adm_member:
+                await channel.set_permissions(adm_member, overwrite=None)
+
+        owner = interaction.guild.owner
+        if owner:
+            await channel.set_permissions(
+                owner,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
 
         await channel.set_permissions(interaction.guild.default_role, view_channel=False)
 
@@ -845,24 +942,14 @@ class AdminEphemeralControlView(discord.ui.View):
             cur.execute("UPDATE matches SET status = 'finished' WHERE match_id = ?", (self.match_id,))
             conn.commit()
 
-        await update_pending_message_embed(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
+        await update_pending_message_status(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
         await update_confirmation_message_status(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
-        await update_control_message(interaction.guild, self.match_id)
-
         await send_staff_log(interaction.guild, f"✅ Partida #{fmt_match_id(self.match_id)} finalizada por {interaction.user.mention}")
-        await interaction.response.send_message("Partida finalizada com sucesso.", ephemeral=True)
 
-    async def generate_pix_callback(self, interaction: discord.Interaction):
-        row = match_row(self.match_id)
-        if not row:
-            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-            return
-
-        if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
-            await interaction.response.send_message("Apenas o ADM responsável pode gerar cobrança.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(PixChargeModal(self.match_id))
+        await interaction.response.edit_message(
+            content=f"✅ **Partida #{fmt_match_id(self.match_id)} finalizada com sucesso.**",
+            view=None
+        )
 
 
 class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
@@ -885,8 +972,8 @@ class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
         )
 
         self.amount = discord.ui.TextInput(
-            label="Valor a receber",
-            placeholder="Ex.: 5,00",
+            label="Valor que cada jogador vai pagar",
+            placeholder="Ex.: 0,50",
             max_length=20,
             required=True
         )
@@ -902,21 +989,17 @@ class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
             return
 
         if not isinstance(interaction.user, discord.Member) or not can_manage_match(interaction.user, row):
-            await interaction.response.send_message("Apenas o ADM responsável pode gerar cobrança.", ephemeral=True)
+            await interaction.response.send_message("Apenas o ADM responsável ou o dono do servidor podem gerar cobrança.", ephemeral=True)
             return
 
         try:
             amount_value = parse_decimal_brl(str(self.amount))
         except (InvalidOperation, ValueError):
-            await interaction.response.send_message("Valor inválido. Use por exemplo: 5,00", ephemeral=True)
+            await interaction.response.send_message("Valor inválido. Use por exemplo: 0,50", ephemeral=True)
             return
 
         pix_key = str(self.pix_key).strip()
         receiver_name = str(self.receiver_name).strip()
-
-        if not pix_key:
-            await interaction.response.send_message("A chave Pix é obrigatória.", ephemeral=True)
-            return
 
         payload = build_pix_payload(
             pix_key=pix_key,
@@ -932,13 +1015,25 @@ class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
             await interaction.response.send_message("Canal da partida não encontrado.", ephemeral=True)
             return
 
+        with closing(db_connect()) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE matches
+                SET status = 'payment_pending',
+                    charge_amount = ?,
+                    pix_receiver_name = ?,
+                    pix_key = ?
+                WHERE match_id = ?
+            """, (str(amount_value), receiver_name, pix_key, self.match_id))
+            conn.commit()
+
         embed = discord.Embed(
             title=f"💳 Cobrança Pix - Partida #{fmt_match_id(self.match_id)}",
             color=0x2ECC71,
             description=(
                 f"👤 **Recebedor:** {receiver_name}\n"
                 f"🔑 **Chave Pix:** `{pix_key}`\n"
-                f"💸 **Valor:** {format_brl(amount_value)}\n\n"
+                f"💸 **Valor por jogador:** R$ {format_brl(amount_value)}\n\n"
                 f"**Pix copia e cola:**\n```{payload}```"
             )
         )
@@ -946,12 +1041,18 @@ class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
         embed.set_footer(text="Envie o comprovante após realizar o pagamento.")
 
         await channel.send(embed=embed, file=qr_file)
+        await update_pending_message_status(interaction.guild, self.match_id, "🟠 Cobrança enviada", 0xF39C12)
+        await update_confirmation_message_status(interaction.guild, self.match_id, "🟠 Cobrança enviada", 0xF39C12)
         await send_staff_log(
             interaction.guild,
-            f"💳 Cobrança Pix gerada na partida #{fmt_match_id(self.match_id)} por {interaction.user.mention} no valor de {format_brl(amount_value)}."
+            f"💳 Cobrança Pix gerada na partida #{fmt_match_id(self.match_id)} por {interaction.user.mention} no valor individual de R$ {format_brl(amount_value)}."
         )
 
-        await interaction.response.send_message("Cobrança Pix enviada no canal da partida.", ephemeral=True)
+        await interaction.response.send_message(
+            f"💳 **Cobrança enviada na partida #{fmt_match_id(self.match_id)}**\nAgora confirme o pagamento quando verificar que todos pagaram.",
+            ephemeral=True,
+            view=AdminFlowView(self.match_id)
+        )
 
 
 # =========================
@@ -967,6 +1068,7 @@ async def create_match_confirmation_room(guild: discord.Guild, panel_id: str):
         return
 
     em_andamento_cat = find_category(guild, NOME_CATEGORIA_EM_ANDAMENTO)
+    owner = guild.owner
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -974,11 +1076,20 @@ async def create_match_confirmation_room(guild: discord.Guild, panel_id: str):
             view_channel=True,
             send_messages=True,
             read_message_history=True,
-            manage_channels=True
+            manage_channels=True,
+            manage_permissions=True
         )
     }
 
-    for uid in players:
+    if owner:
+        overwrites[owner] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True
+        )
+
+    for item in players:
+        uid = item["user_id"]
         member = guild.get_member(int(uid))
         if member is None:
             try:
@@ -1009,8 +1120,9 @@ async def create_match_confirmation_room(guild: discord.Guild, panel_id: str):
                 match_id, panel_id, guild_id, title, mode, info,
                 players_json, confirmed_players_json, status,
                 private_channel_id, pending_message_id, control_message_id,
-                confirmation_message_id, claimed_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_confirmation', ?, NULL, NULL, NULL, NULL)
+                confirmation_message_id, claimed_by, players_details_json,
+                charge_amount, pix_receiver_name, pix_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_confirmation', ?, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL)
         """, (
             match_id,
             panel_id,
@@ -1018,9 +1130,10 @@ async def create_match_confirmation_room(guild: discord.Guild, panel_id: str):
             panel["title"],
             panel["mode"],
             panel["info"],
-            json.dumps(players),
+            json.dumps([p["user_id"] for p in players]),
             json.dumps([]),
-            private_channel.id
+            private_channel.id,
+            json.dumps(players)
         ))
 
         cur.execute("DELETE FROM panel_players WHERE panel_id = ?", (panel_id,))
@@ -1054,7 +1167,7 @@ async def send_match_to_pending(guild: discord.Guild, match_id: int):
         return
 
     msg = await pending_channel.send(
-        embed=build_match_status_embed(match_id, "🟡 Aguardando ADM", 0x3498DB),
+        embed=build_pending_match_embed(match_id),
         view=ClaimMatchView(match_id)
     )
 
@@ -1071,8 +1184,8 @@ async def send_match_to_pending(guild: discord.Guild, match_id: int):
         await private_channel.send("✅ Os jogadores confirmaram. Aguardando ADM assumir a partida.")
 
     await update_confirmation_message_status(guild, match_id, "🟡 Aguardando ADM", 0x3498DB)
-
     bot.add_view(ClaimMatchView(match_id), message_id=msg.id)
+
     await send_staff_log(guild, f"📥 Partida #{fmt_match_id(match_id)} enviada para pendentes.")
 
 
@@ -1081,20 +1194,9 @@ async def assume_match(guild: discord.Guild, adm: discord.Member, match_id: int)
     if not row or row["status"] != "pending":
         return
 
-    players = json.loads(row["players_json"])
     private_channel = guild.get_channel(row["private_channel_id"])
-    adm_role = find_role(guild, NOME_CARGO_ADM)
-
     if not isinstance(private_channel, discord.TextChannel):
         return
-
-    if adm_role:
-        await private_channel.set_permissions(
-            adm_role,
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True
-        )
 
     await private_channel.set_permissions(
         adm,
@@ -1103,211 +1205,34 @@ async def assume_match(guild: discord.Guild, adm: discord.Member, match_id: int)
         read_message_history=True
     )
 
-    control_msg = await private_channel.send(
-        f"🎮 **Painel da Partida #{fmt_match_id(match_id)}**\n"
-        f"ADM responsável: {adm.mention}\n"
-        f"Jogadores: {mention_list_from_ids(players)}\n"
-        f"Status atual: 🟡 Em preparação\n\n"
-        f"O ADM responsável pode abrir o painel privado no botão abaixo.",
-        view=AdminAccessView(match_id)
-    )
-
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE matches
             SET status = 'claimed',
-                claimed_by = ?,
-                control_message_id = ?
+                claimed_by = ?
             WHERE match_id = ?
-        """, (adm.id, control_msg.id, match_id))
+        """, (adm.id, match_id))
         conn.commit()
 
-    bot.add_view(AdminAccessView(match_id), message_id=control_msg.id)
-
-    await update_pending_message_embed(guild, match_id, "🟡 Em preparação", 0xF1C40F)
+    await update_pending_message_status(guild, match_id, "🟡 Em preparação", 0xF1C40F)
     await update_confirmation_message_status(guild, match_id, "🟡 Em preparação", 0xF1C40F)
 
-    await private_channel.send(f"✅ {adm.mention} assumiu a partida. O painel de controle foi liberado para o ADM responsável.")
+    details = get_match_players_details(match_row(match_id))
+    await private_channel.send(
+        f"✅ {adm.mention} assumiu a partida.\n"
+        f"👤 Jogadores: {build_players_vs_from_details(details)}\n"
+        f"📌 Status: Em preparação"
+    )
+
     await send_staff_log(guild, f"🙋 Partida #{fmt_match_id(match_id)} assumida por {adm.mention}.")
 
-async def handle_panel_join(interaction: discord.Interaction, panel_id: str):
-    panel = panel_row(panel_id)
-    if not panel:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Painel não encontrado.", ephemeral=True)
-        return
-
-    if active_match_for_panel(panel_id):
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Já existe uma partida desse painel em andamento ou pendente.", ephemeral=True)
-        return
-
-    uid = str(interaction.user.id)
-    players = panel_players(panel_id)
-
-    if uid in players:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Você já está nessa fila.", ephemeral=True)
-        return
-
-    if len(players) >= panel["max_players"]:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Fila cheia.", ephemeral=True)
-        return
-
-    with closing(db_connect()) as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO panel_players (panel_id, user_id) VALUES (?, ?)", (panel_id, uid))
-        conn.commit()
-
-    if not interaction.response.is_done():
-        await interaction.response.defer()
-
-    await refresh_panel_message(panel_id)
-
-    players = panel_players(panel_id)
-    if len(players) == panel["max_players"]:
-        await create_match_confirmation_room(interaction.guild, panel_id)
-
-
-async def handle_panel_leave(interaction: discord.Interaction, panel_id: str):
-    panel = panel_row(panel_id)
-    if not panel:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Painel não encontrado.", ephemeral=True)
-        return
-
-    uid = str(interaction.user.id)
-    players = panel_players(panel_id)
-
-    if uid not in players:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
-        return
-
-    with closing(db_connect()) as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM panel_players WHERE panel_id = ? AND user_id = ?", (panel_id, uid))
-        conn.commit()
-
-    if not interaction.response.is_done():
-        await interaction.response.defer()
-
-    await refresh_panel_message(panel_id)
-
-
-async def handle_claim_match(interaction: discord.Interaction, match_id: int):
-    row = match_row(match_id)
-    if not row:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-        return
-
-    if row["status"] != "pending":
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Essa partida já foi assumida.", ephemeral=True)
-        return
-
-    if not isinstance(interaction.user, discord.Member) or not is_adm_member(interaction.user):
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Apenas ADMs podem assumir partidas.", ephemeral=True)
-        return
-
-    await assume_match(interaction.guild, interaction.user, match_id)
-
-    if not interaction.response.is_done():
-        await interaction.response.send_message(
-            f"Você assumiu a partida #{fmt_match_id(match_id)}. O painel privado foi liberado para você no canal da partida.",
-            ephemeral=True
-        )
-
-
-async def handle_confirm_match(interaction: discord.Interaction, match_id: int):
-    row = match_row(match_id)
-    if not row:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-        return
-
-    if row["status"] != "awaiting_confirmation":
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Essa partida não está mais aguardando confirmação.", ephemeral=True)
-        return
-
-    uid = str(interaction.user.id)
-    players = json.loads(row["players_json"])
-
-    if uid not in players:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Você não faz parte dessa partida.", ephemeral=True)
-        return
-
-    confirmed = json.loads(row["confirmed_players_json"])
-    if uid in confirmed:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Você já confirmou.", ephemeral=True)
-        return
-
-    confirmed.append(uid)
-
-    with closing(db_connect()) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE matches SET confirmed_players_json = ? WHERE match_id = ?",
-            (json.dumps(confirmed), match_id)
-        )
-        conn.commit()
-
-    if not interaction.response.is_done():
-        await interaction.response.defer()
-
-    await refresh_confirmation_message(interaction.guild, match_id)
-
-    if len(confirmed) == len(players):
-        await send_match_to_pending(interaction.guild, match_id)
-
-
-async def handle_cancel_match(interaction: discord.Interaction, match_id: int):
-    row = match_row(match_id)
-    if not row:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Partida não encontrada.", ephemeral=True)
-        return
-
-    if row["status"] != "awaiting_confirmation":
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Essa partida não pode mais ser cancelada.", ephemeral=True)
-        return
-
-    uid = str(interaction.user.id)
-    players = json.loads(row["players_json"])
-
-    if uid not in players:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Você não faz parte dessa partida.", ephemeral=True)
-        return
-
-    with closing(db_connect()) as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE matches SET status = 'cancelled' WHERE match_id = ?", (match_id,))
-        conn.commit()
-
-    channel = interaction.guild.get_channel(row["private_channel_id"])
-    if isinstance(channel, discord.TextChannel):
-        await channel.send("❌ A partida foi cancelada por um dos jogadores.")
-        await channel.edit(name=f"cancelada-{fmt_match_id(match_id)}")
-
-    await send_staff_log(interaction.guild, f"❌ Partida #{fmt_match_id(match_id)} cancelada por <@{uid}>.")
-
-    if not interaction.response.is_done():
-        await interaction.response.defer()
 
 # =========================
 # COMMANDS
 # =========================
 @bot.command()
-async def painelz(ctx, titulo: str, modo: str, info: str):
+async def painelz(ctx, titulo: str, modo: str, *, info: str):
     max_players = define_max_players(modo)
 
     embed = discord.Embed(title=titulo, color=0x2ECC71)
@@ -1348,57 +1273,12 @@ async def painelz(ctx, titulo: str, modo: str, info: str):
 # READY
 # =========================
 @bot.event
-async def on_interaction(interaction: discord.Interaction):
-    if interaction.type != discord.InteractionType.component:
-        return
-
-    data = interaction.data or {}
-    custom_id = data.get("custom_id")
-
-    if not custom_id:
-        return
-
-    try:
-        if custom_id.startswith("panel_join_"):
-            panel_id = custom_id.replace("panel_join_", "", 1)
-            await handle_panel_join(interaction, panel_id)
-            return
-
-        if custom_id.startswith("panel_leave_"):
-            panel_id = custom_id.replace("panel_leave_", "", 1)
-            await handle_panel_leave(interaction, panel_id)
-            return
-
-        if custom_id.startswith("claim_match_"):
-            match_id = int(custom_id.replace("claim_match_", "", 1))
-            await handle_claim_match(interaction, match_id)
-            return
-
-        if custom_id.startswith("confirm_match_"):
-            match_id = int(custom_id.replace("confirm_match_", "", 1))
-            await handle_confirm_match(interaction, match_id)
-            return
-
-        if custom_id.startswith("cancel_match_"):
-            match_id = int(custom_id.replace("cancel_match_", "", 1))
-            await handle_cancel_match(interaction, match_id)
-            return
-
-    except Exception as e:
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"Erro ao processar interação: {e}", ephemeral=True)
-        except Exception:
-            pass
-
-@bot.event
 async def on_ready():
     db_init()
 
     with closing(db_connect()) as conn:
         cur = conn.cursor()
 
-        # Painéis antigos continuam funcionando
         cur.execute("SELECT panel_id FROM panels")
         for row in cur.fetchall():
             try:
@@ -1406,7 +1286,6 @@ async def on_ready():
             except Exception:
                 pass
 
-        # Partidas aguardando confirmação
         cur.execute("""
             SELECT match_id, confirmation_message_id
             FROM matches
@@ -1418,7 +1297,6 @@ async def on_ready():
             except Exception:
                 pass
 
-        # Partidas pendentes de ADM
         cur.execute("""
             SELECT match_id, pending_message_id
             FROM matches
@@ -1427,18 +1305,6 @@ async def on_ready():
         for row in cur.fetchall():
             try:
                 bot.add_view(ClaimMatchView(row["match_id"]), message_id=row["pending_message_id"])
-            except Exception:
-                pass
-
-        # Partidas assumidas ou em andamento
-        cur.execute("""
-            SELECT match_id, control_message_id
-            FROM matches
-            WHERE status IN ('claimed', 'in_progress') AND control_message_id IS NOT NULL
-        """)
-        for row in cur.fetchall():
-            try:
-                bot.add_view(AdminAccessView(row["match_id"]), message_id=row["control_message_id"])
             except Exception:
                 pass
 
