@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import shlex
 import sqlite3
 from decimal import Decimal, InvalidOperation
 from contextlib import closing
@@ -35,7 +36,7 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 # =========================
@@ -1032,7 +1033,6 @@ async def try_create_match_from_queue(guild: discord.Guild, panel_id: str):
     await create_match_confirmation_room(guild, panel_id, matched_players)
     await refresh_panel_message(panel_id)
 
-    # tenta novamente se ainda houver outra dupla compatível
     await try_create_match_from_queue(guild, panel_id)
 
 
@@ -1241,10 +1241,9 @@ async def assume_match(guild: discord.Guild, adm: discord.Member, match_id: int)
 
 
 # =========================
-# COMMANDS
+# PANEL CREATION
 # =========================
-@bot.command()
-async def painelz(ctx, titulo: str, modo: str, *, info: str):
+async def criar_painel_individual(message: discord.Message, titulo: str, modo: str, info: str):
     embed = discord.Embed(title=titulo, color=0x2ECC71)
     embed.description = (
         f"🎮 **Modo:**\n{modo}\n\n"
@@ -1253,7 +1252,7 @@ async def painelz(ctx, titulo: str, modo: str, *, info: str):
     )
     embed.set_thumbnail(url=IMAGEM_PADRAO)
 
-    msg = await ctx.send(embed=embed)
+    msg = await message.channel.send(embed=embed)
     panel_id = str(msg.id)
 
     with closing(db_connect()) as conn:
@@ -1264,8 +1263,8 @@ async def painelz(ctx, titulo: str, modo: str, *, info: str):
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             panel_id,
-            ctx.guild.id,
-            ctx.channel.id,
+            message.guild.id,
+            message.channel.id,
             titulo,
             modo,
             info,
@@ -1278,6 +1277,55 @@ async def painelz(ctx, titulo: str, modo: str, *, info: str):
     bot.add_view(view, message_id=msg.id)
 
 
+async def processar_multiplos_paineis(message: discord.Message) -> bool:
+    linhas = [linha.strip() for linha in message.content.splitlines() if linha.strip()]
+
+    if not linhas:
+        return False
+
+    if not all(linha.startswith("!painelz") for linha in linhas):
+        return False
+
+    criados = 0
+    erros = []
+
+    for i, linha in enumerate(linhas, start=1):
+        try:
+            partes = shlex.split(linha)
+        except ValueError as e:
+            erros.append(f"Linha {i}: erro nas aspas -> {e}")
+            continue
+
+        if len(partes) != 4 or partes[0] != "!painelz":
+            erros.append(f"Linha {i}: use exatamente !painelz \"titulo\" \"modo\" \"valor\"")
+            continue
+
+        _, titulo, modo, info = partes
+
+        try:
+            await criar_painel_individual(message, titulo, modo, info)
+            criados += 1
+        except Exception as e:
+            erros.append(f"Linha {i}: {e}")
+
+    if criados > 0:
+        texto = f"✅ {criados} painel(is) criado(s) com sucesso."
+        if erros:
+            texto += "\n⚠️ Erros:\n- " + "\n- ".join(erros)
+        await message.channel.send(texto)
+    else:
+        await message.channel.send(
+            "❌ Nenhum painel foi criado.\n"
+            "Use assim, uma linha por painel:\n"
+            "`!painelz \"1x1 LAGARTISSE ELITE\" \"1x1 Mobile\" \"R$100,00\"`"
+        )
+
+    return True
+
+
+# =========================
+# COMMANDS
+# =========================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def limparcanal(ctx):
@@ -1294,44 +1342,30 @@ async def criarpaineis(ctx):
     ]
 
     for p in paineis:
-        embed = discord.Embed(title=p["titulo"], color=0x2ECC71)
-        embed.description = (
-            f"🎮 **Modo:**\n{p['modo']}\n\n"
-            f"💸 **Valor:**\n{p['info']}\n\n"
-            f"👤 **Líderes na fila:**\nNenhum jogador na fila"
-        )
-        embed.set_thumbnail(url=IMAGEM_PADRAO)
-
-        msg = await ctx.send(embed=embed)
-        panel_id = str(msg.id)
-
-        with closing(db_connect()) as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT OR REPLACE INTO panels (
-                    panel_id, guild_id, channel_id, title, mode, info, image_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                panel_id,
-                ctx.guild.id,
-                ctx.channel.id,
-                p["titulo"],
-                p["modo"],
-                p["info"],
-                IMAGEM_PADRAO
-            ))
-            conn.commit()
-
-        view = PanelQueueView(panel_id)
-        await msg.edit(view=view)
-        bot.add_view(view, message_id=msg.id)
+        fake_message = ctx.message
+        await criar_painel_individual(fake_message, p["titulo"], p["modo"], p["info"])
 
     await ctx.send("✅ Painéis criados com sucesso.")
 
 
 # =========================
-# READY
+# EVENTS
 # =========================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    processado = await processar_multiplos_paineis(message)
+    if processado:
+        return
+
+    await bot.process_commands(message)
+
+
 @bot.event
 async def on_ready():
     db_init()
