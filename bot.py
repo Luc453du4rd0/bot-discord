@@ -25,7 +25,7 @@ CANAL_LOGS_STAFF_ID = 1484549436704166020
 NOME_CARGO_ADM = "ADM"
 NOME_CATEGORIA_EM_ANDAMENTO = "EM ANDAMENTO"
 NOME_CATEGORIA_FINALIZADAS = "FINALIZADAS"
-NOME_CATEGORIA_CONTROLE = "CONTROLE ADM"
+NOME_CATEGORIA_CONTROLE = "CONTROLES ADM"
 
 PIX_CIDADE_PADRAO = "TAVARES"
 
@@ -825,87 +825,74 @@ class ControlMatchView(discord.ui.View):
     async def generate_pix_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(PixChargeModal(self.match_id))
 
-    async def confirm_payment_callback(self, interaction: discord.Interaction):
-        row = match_row(self.match_id)
-        private_channel = interaction.guild.get_channel(row["private_channel_id"])
-        if not isinstance(private_channel, discord.TextChannel):
-            await interaction.response.send_message("Canal inválido.", ephemeral=True)
-            return
+   async def confirm_payment_callback(self, interaction: discord.Interaction):
+    await interaction.response.defer()
 
-        if not row["charge_amount"]:
-            await interaction.response.send_message("Nenhuma cobrança foi gerada ainda.", ephemeral=True)
-            return
+    row = match_row(self.match_id)
+    private_channel = interaction.guild.get_channel(row["private_channel_id"])
+    if not isinstance(private_channel, discord.TextChannel):
+        return
 
-        amount_each = Decimal(str(row["charge_amount"])).quantize(Decimal("0.01"))
-        payout = amount_each * Decimal(2)
-        payout_str = format_brl(payout)
+    # Usa o valor do painel, não o valor digitado no Pix
+    panel_value = parse_decimal_brl(str(row["info"]))
+    payout_str = format_brl(panel_value)
 
-        await private_channel.edit(name=safe_channel_name(f"pagar-{payout_str}"))
+    await private_channel.edit(name=safe_channel_name(f"pagar-{payout_str}"))
 
-        with closing(db_connect()) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE matches SET status = 'payment_confirmed' WHERE match_id = ?", (self.match_id,))
-            conn.commit()
+    with closing(db_connect()) as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE matches SET status = 'payment_confirmed' WHERE match_id = ?", (self.match_id,))
+        conn.commit()
 
-        await update_pending_message(interaction.guild, self.match_id, f"🟢 Pagamento confirmado • pagar {payout_str}", 0x2ECC71)
-        await update_confirmation_message_status(interaction.guild, self.match_id, f"🟢 Pagamento confirmado • pagar {payout_str}", 0x2ECC71)
-        await update_control_message(interaction.guild, self.match_id)
-        await send_staff_log(interaction.guild, f"💰 Pagamento confirmado na partida #{fmt_match_id(self.match_id)} por {interaction.user.mention}")
+    await update_pending_message(
+        interaction.guild,
+        self.match_id,
+        f"🟢 Pagamento confirmado • pagar {payout_str}",
+        0x2ECC71
+    )
 
-        await interaction.response.defer()
+    await update_confirmation_message_status(
+        interaction.guild,
+        self.match_id,
+        f"🟢 Pagamento confirmado • pagar {payout_str}",
+        0x2ECC71
+    )
+
+    await update_control_message(interaction.guild, self.match_id)
+    await send_staff_log(
+        interaction.guild,
+        f"💰 Pagamento confirmado na partida #{fmt_match_id(self.match_id)} por {interaction.user.mention}"
+    )
 
     async def finish_callback(self, interaction: discord.Interaction):
-        row = match_row(self.match_id)
-        private_channel = interaction.guild.get_channel(row["private_channel_id"])
-        control_channel = interaction.guild.get_channel(row["control_channel_id"])
+    # Responde imediatamente para não dar "Esta interação falhou"
+    await interaction.response.defer()
 
-        if not isinstance(private_channel, discord.TextChannel):
-            await interaction.response.send_message("Canal da partida não encontrado.", ephemeral=True)
-            return
+    row = match_row(self.match_id)
 
-        final_cat = find_category(interaction.guild, NOME_CATEGORIA_FINALIZADAS)
-        if final_cat:
-            await private_channel.edit(name=f"finalizados-{fmt_match_id(self.match_id)}", category=final_cat)
-        else:
-            await private_channel.edit(name=f"finalizados-{fmt_match_id(self.match_id)}")
+    private_channel = interaction.guild.get_channel(row["private_channel_id"])
+    control_channel = interaction.guild.get_channel(row["control_channel_id"])
 
-        details = get_match_players_details(row)
+    if not isinstance(private_channel, discord.TextChannel):
+        return
 
-        for item in details:
-            member = interaction.guild.get_member(int(item["user_id"]))
-            if member:
-                await private_channel.set_permissions(member, overwrite=None)
+    final_cat = find_category(interaction.guild, NOME_CATEGORIA_FINALIZADAS)
 
-        if row["claimed_by"]:
-            adm_member = interaction.guild.get_member(int(row["claimed_by"]))
-            if adm_member:
-                await private_channel.set_permissions(adm_member, overwrite=None)
+    if final_cat:
+        await private_channel.edit(
+            name=f"finalizados-{fmt_match_id(self.match_id)}",
+            category=final_cat
+        )
+    else:
+        await private_channel.edit(
+            name=f"finalizados-{fmt_match_id(self.match_id)}"
+        )
 
-        owner = interaction.guild.owner
-        if owner:
-            await private_channel.set_permissions(
-                owner,
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
+    details = get_match_players_details(row)
 
-        await private_channel.set_permissions(interaction.guild.default_role, view_channel=False)
-
-        with closing(db_connect()) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE matches SET status = 'finished' WHERE match_id = ?", (self.match_id,))
-            conn.commit()
-
-        await update_pending_message(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
-        await update_confirmation_message_status(interaction.guild, self.match_id, "✅ Finalizada", 0x95A5A6)
-        await send_staff_log(interaction.guild, f"✅ Partida #{fmt_match_id(self.match_id)} finalizada por {interaction.user.mention}")
-
-        if isinstance(control_channel, discord.TextChannel):
-            await control_channel.delete(reason="Controle finalizado")
-
-        await interaction.response.defer()
-
+    # Remove acesso dos jogadores
+    for item in details:
+        member = interaction.guild
 
 class PixChargeModal(discord.ui.Modal, title="Gerar cobrança Pix"):
     def __init__(self, match_id: int):
